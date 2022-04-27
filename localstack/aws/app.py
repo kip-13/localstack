@@ -36,6 +36,7 @@ class LocalstackAwsGateway(Gateway):
         # the main request handler chain
         self.request_handlers.extend(
             [
+                handlers.push_quart_context,
                 handlers.serve_localstack_resources,  # try to serve internal resources first
                 serve_default_listeners,
                 serve_custom_routes,
@@ -65,6 +66,7 @@ class LocalstackAwsGateway(Gateway):
         self.response_handlers.extend(
             [
                 self.log_response,
+                handlers.pop_quart_context,
             ]
         )
 

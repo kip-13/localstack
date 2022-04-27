@@ -19,10 +19,27 @@ from .api.core import ServiceOperation
 from .chain import ExceptionHandler, Handler, HandlerChain, HandlerChainAdapter
 from .protocol.parser import RequestParser, create_parser
 from .protocol.serializer import create_serializer
+from .protocol.service_router import determine_aws_service_name
 from .skeleton import Skeleton, create_skeleton
 from .spec import load_service
 
 LOG = logging.getLogger(__name__)
+
+
+class PushQuartContext(Handler):
+    def __call__(self, chain: HandlerChain, context: RequestContext, response: Response):
+        # hack for legacy compatibility. this is wrong on so many levels i literally can't even.
+        import quart.globals
+
+        quart.globals._request_ctx_stack.push(context)
+
+
+class PopQuartContext(Handler):
+    def __call__(self, chain: HandlerChain, context: RequestContext, response: Response):
+        # hack for legacy compatibility
+        import quart.globals
+
+        quart.globals._request_ctx_stack.pop()
 
 
 class ServiceNameParser(Handler):
@@ -31,13 +48,10 @@ class ServiceNameParser(Handler):
     """
 
     def __call__(self, chain: HandlerChain, context: RequestContext, response: Response):
-        service = self.guess_aws_service(context.request)
+        service = determine_aws_service_name(context.request)
 
         if not service:
-            LOG.warning("unable to determine service from request")
             return
-        else:
-            LOG.debug("determined service %s", service)
 
         context.service = self.get_service_model(service)
         headers = context.request.headers
@@ -46,87 +60,6 @@ class ServiceNameParser(Handler):
     @lru_cache()
     def get_service_model(self, service: str) -> ServiceModel:
         return load_service(service)
-
-    def guess_aws_service(self, request: Request) -> Optional[str]:
-        headers = request.headers
-
-        host = request.host
-        auth_header = headers.get("authorization", "")
-        target = headers.get("x-amz-target", "")
-
-        LOG.debug(
-            "determining service from request host='%s', x-amz-target='%s', auth_header='%s'",
-            host,
-            target,
-            auth_header,
-        )
-
-        if not auth_header and not target and "." not in host:
-            # no way of determining target API
-            return
-
-        service = self.extract_service_name_from_auth_header(auth_header)
-
-        if service:
-            # check service aliases
-            if service == "monitoring":
-                return "cloudwatch"
-            elif service == "email":
-                return "ses"
-            elif service == "execute-api":
-                return "apigateway"
-            elif service == "EventBridge":
-                return "events"
-
-            return service
-
-        # check x-amz-target rules
-        if target.startswith("Firehose_"):
-            return "firehose"
-        elif target.startswith("DynamoDB_"):
-            return "dynamodb"
-        elif target.startswith("DynamoDBStreams") or host.startswith("streams.dynamodb."):
-            # Note: DDB streams requests use ../dynamodb/.. auth header, hence we also need to update result_before
-            return "dynamodbstreams"
-        elif target.startswith("AWSEvents"):
-            return "events"
-        elif target.startswith("ResourceGroupsTaggingAPI_"):
-            return "resourcegroupstaggingapi"
-        elif target.startswith("AWSCognitoIdentityProviderService") or "cognito-idp." in host:
-            return "cognito-idp"
-        elif target.startswith("AWSCognitoIdentityService") or "cognito-identity." in host:
-            return "cognito-identity"
-
-        # check host matching rules
-        if host.endswith("cloudfront.net"):
-            return "cloudfront"
-        elif host.startswith("states."):
-            return "stepfunctions"
-        elif "route53." in host:
-            return "route53"
-        elif ".execute-api." in host:
-            return "apigateway"
-
-        # check special S3 rules
-        if self.uses_host_addressing(headers):
-            return "s3"
-
-        return None
-
-    @staticmethod
-    def uses_host_addressing(headers):
-        from localstack.services.s3.s3_utils import uses_host_addressing
-
-        return uses_host_addressing(headers)
-
-    @staticmethod
-    def extract_service_name_from_auth_header(auth_header: str) -> Optional[str]:
-        try:
-            credential_scope = auth_header.split(",")[0].split()[1]
-            _, _, _, service, _ = credential_scope.split("/")
-            return service
-        except Exception:
-            return None
 
 
 class CustomServiceRules(HandlerChainAdapter):
@@ -364,20 +297,17 @@ class ServiceExceptionSerializer(ExceptionHandler):
         if not context.service:
             return
 
-        if not context.operation:
-            return
-
         error = self.create_exception_response(exception, context)
         if error:
             response.update_from(error)
 
-    def create_exception_response(self, exception, context):
+    def create_exception_response(self, exception: Exception, context: RequestContext):
         operation = context.operation
+        service_name = context.service.service_name
         error = exception
 
-        if isinstance(exception, NotImplementedError):
+        if operation and isinstance(exception, NotImplementedError):
             action_name = operation.name
-            service_name = operation.service_model.service_name
             message = (
                 f"API action '{action_name}' for service '{service_name}' " f"not yet implemented"
             )
@@ -388,10 +318,22 @@ class ServiceExceptionSerializer(ExceptionHandler):
             if not self.handle_internal_failures:
                 return
             # wrap exception for serialization
-            service_name = operation.service_model.service_name
-            operation_name = operation.name
-            msg = "exception while calling %s.%s: %s" % (service_name, operation_name, exception)
-            error = CommonServiceException("InternalFailure", msg, status_code=500)
+            if operation:
+                operation_name = operation.name
+                msg = "exception while calling %s.%s: %s" % (
+                    service_name,
+                    operation_name,
+                    exception,
+                )
+            else:
+                # just use any operation for mocking purposes (the parser needs it to populate the default response)
+                operation = context.service.operation_model(context.service.operation_names[0])
+                msg = "exception while calling %s with unknown operation: %s" % (
+                    service_name,
+                    exception,
+                )
+
+            error = CommonServiceException("LocalStackError", msg, status_code=500)
 
         serializer = create_serializer(context.service)  # TODO: serializer cache
         return serializer.serialize_error_to_response(error, operation)
@@ -409,7 +351,7 @@ class InternalFailureHandler(ExceptionHandler):
         context: RequestContext,
         response: Response,
     ):
-        if response.data:
+        if response.response:
             # response already set
             return
 
@@ -438,7 +380,7 @@ class LegacyPluginHandler(Handler):
             api=context.service.service_name,
             method=request.method,
             path=request.full_path if request.query_string else request.path,
-            data=request.get_data(True),
+            data=request.get_data(cache=True),
             headers=request.headers,
             port=None,
         )
@@ -458,8 +400,9 @@ class LegacyPluginHandler(Handler):
 
         if isinstance(result, RequestsResponse):
             response.status_code = result.status_code
+            response.set_response(result.content)
+            # make sure headers are set after the content, so potential content-length headers are overwritten
             response.headers.update(dict(result.headers))
-            response.data = result.content
             chain.stop()
             return
 
@@ -485,7 +428,7 @@ class EmptyResponseHandler(Handler):
             self.populate_default_response(response)
 
     def is_empty_response(self, response: Response):
-        return response.status_code in [0, None] or not response.data
+        return response.status_code in [0, None] and not response.response
 
     def populate_default_response(self, response: Response):
         response.status_code = self.status_code
@@ -503,3 +446,6 @@ handle_service_exception = ServiceExceptionSerializer()
 handle_internal_failure = InternalFailureHandler()
 handle_empty_response = EmptyResponseHandler()
 serve_localstack_resources = LocalstackResourceHandler()
+# legacy compatibility handlers for when
+pop_quart_context = PopQuartContext()
+push_quart_context = PushQuartContext()
