@@ -1,3 +1,4 @@
+"""This module contains code to make ASGI play nice with WSGI."""
 import asyncio
 import io
 import logging
@@ -9,7 +10,7 @@ from urllib.parse import urlparse
 
 if t.TYPE_CHECKING:
     from _typeshed import WSGIApplication, WSGIEnvironment
-    from asgiref.typing import ASGIReceiveCallable, ASGISendCallable, HTTPScope, Scope
+    from hypercorn.typing import ASGIReceiveCallable, ASGISendCallable, HTTPScope, Scope
 
 LOG = logging.getLogger(__name__)
 
