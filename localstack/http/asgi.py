@@ -1,7 +1,6 @@
 """This module contains code to make ASGI play nice with WSGI."""
 import asyncio
 import io
-import logging
 import math
 import typing as t
 from asyncio import AbstractEventLoop
@@ -11,8 +10,6 @@ from urllib.parse import urlparse
 if t.TYPE_CHECKING:
     from _typeshed import WSGIApplication, WSGIEnvironment
     from hypercorn.typing import ASGIReceiveCallable, ASGISendCallable, HTTPScope, Scope
-
-LOG = logging.getLogger(__name__)
 
 
 def populate_wsgi_environment(environ: "WSGIEnvironment", scope: "HTTPScope"):
@@ -25,14 +22,19 @@ def populate_wsgi_environment(environ: "WSGIEnvironment", scope: "HTTPScope"):
     environ["REQUEST_METHOD"] = scope["method"]
     # path/uri info
     environ["SCRIPT_NAME"] = scope.get("root_path", "").rstrip("/")
+
     path = scope["path"]
     path = path if path[0] == "/" else urlparse(path).path
     environ["PATH_INFO"] = path
-    environ["RAW_URI"] = scope["raw_path"]
 
     query_string = scope.get("query_string")
     if query_string:
+        raw_uri = scope["raw_path"] + b"?" + query_string
         environ["QUERY_STRING"] = query_string.decode("latin1")
+    else:
+        raw_uri = scope["raw_path"]
+
+    environ["RAW_URI"] = environ["REQUEST_URI"] = raw_uri.decode("utf-8")
 
     # server address / host
     server = scope.get("server") or ("localhost", 80)
@@ -66,10 +68,41 @@ def populate_wsgi_environment(environ: "WSGIEnvironment", scope: "HTTPScope"):
     environ["wsgi.run_once"] = False
 
 
+async def to_async_generator(
+    it: t.Iterator,
+    loop: t.Optional[AbstractEventLoop] = None,
+    executor: t.Optional[Executor] = None,
+) -> t.AsyncGenerator:
+    """
+    Wraps a given synchronous Iterator as an async generator, where each invocation to ``next(it)``
+    will be wrapped in a coroutine execution.
+
+    :param it: the iterator to wrap
+    :param loop: the event loop to run the next invocations
+    :param executor: the executor to run the synchronous code
+    :return: an async generator
+    """
+    loop = loop or asyncio.get_event_loop()
+    stop = object()
+
+    def _next_sync():
+        try:
+            # this call may potentially call blocking IO, which is why we call it in an executor
+            return next(it)
+        except StopIteration:
+            return stop
+
+    while True:
+        val = await loop.run_in_executor(executor, _next_sync)
+        if val is stop:
+            return
+        yield val
+
+
 class HTTPRequestEventStreamAdapter:
     """
-    Minimal adapter to expose an ASGIReceiveCallable coroutine that returns HTTPRequestEvent
-    instances, as an IO[bytes] stream for consumption in synchronous WSGI/Werkzeug code.
+    An adapter to expose an ASGIReceiveCallable coroutine that returns HTTPRequestEvent
+    instances, as a PEP 3333 InputStream for consumption in synchronous WSGI/Werkzeug code.
     """
 
     def __init__(
@@ -79,28 +112,118 @@ class HTTPRequestEventStreamAdapter:
         self.receive = receive
         self.event_loop = event_loop or asyncio.get_event_loop()
 
-    def read(self, size: int = -1) -> bytes:
-        # TODO: better implementation
+        self._more_body = True
+        self._buffer = bytearray()
+
+    def _read_into(self, buf: bytearray) -> t.Tuple[int, bool]:
+        if not self._more_body:
+            return 0, False
+
+        recv_future = asyncio.run_coroutine_threadsafe(self.receive(), self.event_loop)
+        event = recv_future.result()
         # TODO: disconnect events
+        body = event["body"]
+        more = event.get("more_body", False)
+        buf.extend(body)
+        self._more_body = more
+        return len(body), more
 
-        if size != -1:
-            raise NotImplementedError("can only read from stream exhaustively")
+    def read(self, size: t.Optional[int] = None) -> bytes:
+        """
+        Reads up to ``size`` bytes from the object and returns them. As a convenience, if ``size`` is unspecified or
+        ``-1``, all bytes until EOF are returned. Like RawIOBase specifies, only one system call is ever made (in
+        this case, a call to the ASGI receive callable). Fewer than ``size`` bytes may be returned if the underlying
+        call returns fewer than ``size`` bytes.
 
-        arr = bytearray()
+        :param size: the number of bytes to read
+        :return:
+        """
+        buf = self._buffer
 
-        more = True
-        while more:
-            recv_future = asyncio.run_coroutine_threadsafe(self.receive(), self.event_loop)
-            event = recv_future.result()
-            body = event["body"]
-            if body:
-                arr.extend(body)
-            more = event.get("more_body", False)
+        if not buf and not self._more_body:
+            return b""
 
-        return arr
+        if size is None or size == -1:
+            while True:
+                read, more = self._read_into(buf)
+                if not more:
+                    break
+
+            arr = bytes(buf)
+            buf.clear()
+            return arr
+
+        if len(buf) < size:
+            self._read_into(buf)
+
+        copy = bytes(buf[:size])
+        self._buffer = buf[size:]
+        return copy
+
+    def readline(self, size: t.Optional[int] = None) -> bytes:
+        buf = self._buffer
+        size = size if size is not None else -1
+
+        while True:
+            i = buf.find(b"\n")  # FIXME: scans the whole buffer every time
+
+            if i >= 0:
+                if 0 < size < i:
+                    break  # no '\n' in range
+                else:
+                    arr = bytes(buf[: (i + 1)])
+                    self._buffer = buf[(i + 1) :]
+                    return arr
+
+            # ensure the buffer has at least `size` bytes (or all)
+            if size > 0:
+                if len(buf) >= size:
+                    break
+            _, more = self._read_into(buf)
+            if not more:
+                break
+
+        if size > 0:
+            arr = bytes(buf[:size])
+            self._buffer = buf[size:]
+            return arr
+        else:
+            arr = bytes(buf)
+            buf.clear()
+            return arr
+
+    def readlines(self, size: t.Optional[int] = None) -> t.List[bytes]:
+        if size is None or size < 0:
+            return [line for line in self]
+
+        lines = []
+        while size > 0:
+            try:
+                line = self.__next__()
+            except StopIteration:
+                return lines
+
+            lines.append(line)
+            size = size - len(line)
+
+        return lines
+
+    def __next__(self):
+        line = self.readline()
+        if line == b"" and not self._more_body:
+            raise StopIteration()
+        return line
+
+    def __iter__(self):
+        return self
 
 
 class WsgiStartResponse:
+    """
+    A wrapper that exposes an async ``ASGISendCallable`` as synchronous a WSGI ``StartResponse`` protocol callable.
+    See this stackoverflow post for a good explanation: https://stackoverflow.com/a/16775731/804840.
+    """
+
     def __init__(
         self,
         send: "ASGISendCallable",
@@ -121,6 +244,14 @@ class WsgiStartResponse:
     def start_response_sync(
         self, status: str, headers: t.List[t.Tuple[str, str]], exec_info=None
     ) -> t.Callable[[bytes], t.Any]:
+        """
+        The WSGI start_response protocol.
+
+        :param status: the HTTP status (e.g., ``200 OK``) to write
+        :param headers: the HTTP headers to write
+        :param exec_info: ignored
+        :return: a callable that lets you write bytes to the response body
+        """
         send = self.send
         loop = self.event_loop
 
@@ -164,37 +295,6 @@ class WsgiStartResponse:
         if not self.finalized:
             self.finalized = True
             await self.send({"type": "http.response.body", "body": b"", "more_body": False})
-
-
-async def to_async_generator(
-    it: t.Iterator,
-    loop: t.Optional[AbstractEventLoop] = None,
-    executor: t.Optional[Executor] = None,
-) -> t.AsyncGenerator:
-    """
-    Wraps a given synchronous Iterator as an async generator, where each invocation to ``next(it)``
-    will be wrapped in a coroutine execution.
-
-    :param it: the iterator to wrap
-    :param loop: the event loop to run the next invocations
-    :param executor: the executor to run the synchronous code
-    :return: an async generator
-    """
-    loop = loop or asyncio.get_event_loop()
-    stop = object()
-
-    def _next_sync():
-        try:
-            # this call may potentially call blocking IO, which is why we call it in an executor
-            return next(it)
-        except StopIteration:
-            return stop
-
-    while True:
-        val = await loop.run_in_executor(executor, _next_sync)
-        if val is stop:
-            return
-        yield val
 
 
 class ASGIAdapter:
@@ -246,7 +346,9 @@ class ASGIAdapter:
         populate_wsgi_environment(environ, scope)
         # add IO wrappers
         environ["wsgi.input"] = HTTPRequestEventStreamAdapter(receive, event_loop=self.event_loop)
-        environ["wsgi.input_terminated"] = True
+        environ[
+            "wsgi.input_terminated"
+        ] = True  # indicates that the stream is EOF terminated per request
         return environ
 
     async def handle_http(

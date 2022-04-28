@@ -3,7 +3,7 @@ from typing import List
 
 import pytest
 import requests
-from hypercorn.run import Config
+from hypercorn import Config
 from hypercorn.typing import ASGI3Framework
 from werkzeug import Request, Response
 
@@ -58,16 +58,18 @@ def test_serve_app(serve_app):
     assert response1.text == "ok"
 
     request0 = request_list[0]
-    assert request0.path.endswith("/foobar")
+    assert request0.path == "/foobar"
+    assert request0.query_string == b"foo=bar"
+    assert request0.full_path == "/foobar?foo=bar"
     assert request0.headers["x-amz-target"] == "testing"
     assert dict(request0.args) == {"foo": "bar"}
 
     request1 = request_list[1]
-    assert request1.path.endswith("/compute")
+    assert request1.path == "/compute"
     assert request1.get_data() == b'{"foo": "bar"}'
 
 
-def test_generator_creates_chunked_transfer_encoding(serve_app):
+def test_chunked_transfer_encoding_response(serve_app):
     # this test makes sure that creating a response with a generator automatically creates a
     # transfer-encoding=chunked response
 
@@ -90,3 +92,103 @@ def test_generator_creates_chunked_transfer_encoding(serve_app):
 
     assert next(it) == b"foobar"
     assert next(it) == b"baz"
+
+
+def test_chunked_transfer_encoding_request(serve_app):
+    request_list: List[Request] = []
+
+    @Request.application
+    def app(request: Request) -> Response:
+        request_list.append(request)
+
+        stream = request.stream
+        data = bytearray()
+
+        for i, item in enumerate(stream):
+            data.extend(item)
+
+            if i == 0:
+                assert item == b"foobar\n"
+            if i == 1:
+                assert item == b"baz"
+
+        return Response(data.decode("utf-8"), 200)
+
+    server = serve_app(ASGIAdapter(app))
+
+    def gen():
+        yield b"foo"
+        yield b"bar\n"
+        yield b"baz"
+
+    response = requests.post(server.url, gen())
+    assert response.ok
+    assert response.text == "foobar\nbaz"
+
+    assert request_list[0].headers["Transfer-Encoding"].lower() == "chunked"
+
+
+def test_input_stream_methods(serve_app):
+    @Request.application
+    def app(request: Request) -> Response:
+        assert request.stream.read(1) == b"f"
+        assert request.stream.readline(10) == b"ood\n"
+        assert request.stream.readline(3) == b"bar"
+        assert next(request.stream) == b"ber\n"
+        assert request.stream.readlines(3) == [b"fizz\n"]
+        assert request.stream.readline() == b"buzz\n"
+        assert request.stream.read() == b"really\ndone"
+        assert request.stream.read(10) == b""
+
+        return Response("ok", 200)
+
+    server = serve_app(ASGIAdapter(app))
+
+    def gen():
+        yield b"fo"
+        yield b"od\n"
+        yield b"barber\n"
+        yield b"fizz\n"
+        yield b"buzz\n"
+        yield b"really\n"
+        yield b"done"
+
+    response = requests.post(server.url, data=gen())
+    assert response.ok
+    assert response.text == "ok"
+
+
+def test_input_stream_readlines(serve_app):
+    @Request.application
+    def app(request: Request) -> Response:
+        assert request.stream.readlines() == [b"fizz\n", b"buzz\n", b"done"]
+        return Response("ok", 200)
+
+    server = serve_app(ASGIAdapter(app))
+
+    def gen():
+        yield b"fizz\n"
+        yield b"buzz\n"
+        yield b"done"
+
+    response = requests.post(server.url, data=gen())
+    assert response.ok
+    assert response.text == "ok"
+
+
+def test_input_stream_readlines_with_limit(serve_app):
+    @Request.application
+    def app(request: Request) -> Response:
+        assert request.stream.readlines(1000) == [b"fizz\n", b"buzz\n", b"done"]
+        return Response("ok", 200)
+
+    server = serve_app(ASGIAdapter(app))
+
+    def gen():
+        yield b"fizz\n"
+        yield b"buzz\n"
+        yield b"done"
+
+    response = requests.post(server.url, data=gen())
+    assert response.ok
+    assert response.text == "ok"
