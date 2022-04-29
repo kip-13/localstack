@@ -52,7 +52,6 @@ from localstack.utils.server import http2_server
 from localstack.utils.serving import Server
 from localstack.utils.strings import to_bytes, to_str
 from localstack.utils.threads import start_thread
-from localstack.utils.urls import path_from_url
 
 # set up logger
 LOG = logging.getLogger(__name__)
@@ -121,7 +120,7 @@ if EXTRA_CORS_ALLOWED_ORIGINS:
     ALLOWED_CORS_ORIGINS += EXTRA_CORS_ALLOWED_ORIGINS.split(",")
 
 
-class ProxyListener(object):
+class ProxyListener:
     # List of `ProxyListener` instances that are enabled by default for all requests.
     # For inbound flows, the default listeners are applied *before* forwarding requests
     # to the backend; for outbound flows, the default listeners are applied *after* the
@@ -351,7 +350,7 @@ class ArnPartitionRewriteListener(MessageModifyingProxyListener):
 T = TypeVar("T", bound="RegionBackend")
 
 
-class RegionBackend(object):
+class RegionBackend:
     """Base class for region-specific backends for the different APIs.
     RegionBackend lookup methods are not thread safe."""
 
@@ -472,12 +471,11 @@ def should_enforce_self_managed_service(method, path, headers, data):
     if config.DISABLE_CUSTOM_CORS_S3 and config.DISABLE_CUSTOM_CORS_APIGATEWAY:
         return True
     # allow only certain api calls without checking origin
-    import localstack.services.edge
+    from localstack.aws.protocol.service_router import determine_aws_service_name
+    from localstack.http.adapters import create_request_from_parts
 
-    api, _ = localstack.services.edge.get_api_from_custom_rules(method, path, data, headers) or (
-        "",
-        None,
-    )
+    request = create_request_from_parts(method, path, data, headers)
+    api = determine_aws_service_name(request)
     if not config.DISABLE_CUSTOM_CORS_S3 and api == "s3":
         return False
     if not config.DISABLE_CUSTOM_CORS_APIGATEWAY and api == "apigateway":
@@ -771,7 +769,7 @@ class DuplexSocket(ssl.SSLSocket):
 ssl.SSLContext.sslsocket_class = DuplexSocket
 
 
-class GenericProxy(object):
+class GenericProxy:
     # TODO: move methods to different class?
     @classmethod
     def create_ssl_cert(cls, serial_number=None):
@@ -942,7 +940,7 @@ def get_cert_pem_file_path():
 
 def start_proxy_server(
     port,
-    bind_address=None,
+    bind_address: Union[str, List[str]] = None,
     forward_url=None,
     use_ssl=None,
     update_listener: Optional[Union[ProxyListener, List[ProxyListener]]] = None,
@@ -953,7 +951,10 @@ def start_proxy_server(
     max_content_length: int = None,
     send_timeout: int = None,
 ):
-    bind_address = bind_address if bind_address else BIND_HOST
+    if bind_address:
+        bind_addresses = bind_address if isinstance(bind_address, List) else [bind_address]
+    else:
+        bind_addresses = [BIND_HOST]
 
     if update_listener is None:
         listeners = []
@@ -964,7 +965,7 @@ def start_proxy_server(
 
     def handler(request, data):
         parsed_url = urlparse(request.url)
-        path_with_params = path_from_url(request.url)
+        path_with_params = request.full_path.strip("?")
         method = request.method
         headers = request.headers
         headers[HEADER_LOCALSTACK_REQUEST_URL] = str(request.url)
@@ -988,7 +989,7 @@ def start_proxy_server(
 
     result = http2_server.run_server(
         port,
-        bind_address,
+        bind_addresses=bind_addresses,
         handler=handler,
         asynchronous=asynchronous,
         ssl_creds=ssl_creds,
